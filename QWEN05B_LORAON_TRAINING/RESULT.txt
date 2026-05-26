@@ -1,0 +1,76 @@
+평균 벡터 변화량 (Before→After): 0.0225
+
+[Before LoRA] True-label 기준 분리도
+  Silhouette        : 0.0704  (>0.3 양호, >0.5 우수)
+  Davies-Bouldin    : 3.0499  (낮을수록 좋음)
+  --- 클러스터별 응집도 (intra) ---
+    [0] Malicious      : 0.3616
+    [1] ChatbotHarm    : 0.4045
+    [2] InfoHazard     : 0.4142
+    [3] Misinfo        : 0.4495
+    [4] Discrim        : 0.4499
+  --- 클러스터 간 분리도 (inter) ---
+    Malicious <-> ChatbotHar: 0.2239
+    Malicious <-> InfoHazard: 0.2547
+    Malicious <-> Misinfo: 0.2215
+    Malicious <-> Discrim: 0.2136
+    ChatbotHar <-> InfoHazard: 0.2413
+    ChatbotHar <-> Misinfo: 0.1726
+    ChatbotHar <-> Discrim: 0.2027
+    InfoHazard <-> Misinfo: 0.2256
+    InfoHazard <-> Discrim: 0.2392
+    Misinfo <-> Discrim: 0.2316
+
+[After LoRA] True-label 기준 분리도
+  Silhouette        : 0.0714  (>0.3 양호, >0.5 우수)
+  Davies-Bouldin    : 3.0506  (낮을수록 좋음)
+  --- 클러스터별 응집도 (intra) ---
+    [0] Malicious      : 0.3670
+    [1] ChatbotHarm    : 0.4091
+    [2] InfoHazard     : 0.4171
+    [3] Misinfo        : 0.4525
+    [4] Discrim        : 0.4567
+  --- 클러스터 간 분리도 (inter) ---
+    Malicious <-> ChatbotHar: 0.2256
+    Malicious <-> InfoHazard: 0.2603
+    Malicious <-> Misinfo: 0.2237
+    Malicious <-> Discrim: 0.2166
+    ChatbotHar <-> InfoHazard: 0.2450
+    ChatbotHar <-> Misinfo: 0.1733
+    ChatbotHar <-> Discrim: 0.2056
+    InfoHazard <-> Misinfo: 0.2299
+    InfoHazard <-> Discrim: 0.2449
+    Misinfo <-> Discrim: 0.2344
+
+========== Before vs After (True-label 기준) ==========
+  Silhouette : 0.0704 → 0.0714  ✅ 개선
+  D-B Index  : 3.0499 → 3.0506  ❌ 악화
+
+[Before LoRA] 클러스터 회복도 (새 K-Means vs True-label)
+  새 K-Means(k=5) 실행...
+  NMI                : 0.4700  (1=완벽 일치, 0=무관)
+  ARI                : 0.3763  (1=완벽 일치, 0=random, <0=매우 다름)
+  Hungarian Accuracy : 0.5920  (최적 permutation 후 정확도)
+
+[After LoRA] 클러스터 회복도 (새 K-Means vs True-label)
+  새 K-Means(k=5) 실행...
+  NMI                : 0.5066  (1=완벽 일치, 0=무관)
+  ARI                : 0.4112  (1=완벽 일치, 0=random, <0=매우 다름)
+  Hungarian Accuracy : 0.5800  (최적 permutation 후 정확도)
+
+========== 클러스터 회복도 변화 ==========
+  NMI               : 0.4700 → 0.5066  ✅ 개선
+  ARI               : 0.3763 → 0.4112  ✅ 개선
+  Hungarian Accuracy: 0.5920 → 0.5800  ❌ 악화
+t-SNE 저장: crush_tsne_before_after_train.png
+
+[After LoRA] Confusion Matrix (true × predicted-by-new-KMeans)
+  (행: true label, 열: K-Means 클러스터 ID)
+         C0    C1    C2    C3    C4
+  Malicious      0    43     0     2     5
+  ChatbotHar     0     2    27    15     6
+  InfoHazard    43     5     2     0     0
+  Misinfo        1    29    18     1     1
+  Discrim        0     2     0    31    17
+저장 완료: ours_qwen0.5b.txt
+TOTAL=250, MIXED=62, CORRECT/STABLE=188
