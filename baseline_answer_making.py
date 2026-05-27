@@ -1,36 +1,37 @@
-# pip install -U transformers datasets accelerate torch tqdm pandas
-
 import torch
 import pandas as pd
 from tqdm import tqdm
 from datasets import load_dataset
 from transformers import AutoTokenizer, AutoModelForCausalLM
 
-MODEL_ID = "Qwen/Qwen2-0.5B-Instruct"
-DATASET_ID = "LibrAI/do-not-answer"
+MODEL_ID = "meta-llama/Llama-3.1-8B-Instruct"
+DATASET_ID = "Malicious Uses.txt"
 
-OUT_CSV = "jailbreakTest.csv"
-OUT_JSONL = "jailbreakTest.jsonl"
+OUT_JSONL = "jailbreakTest_Malicious Uses.jsonl"
 
 MAX_NEW_TOKENS = 128
 BATCH_SIZE = 4
 
-ds = load_dataset(DATASET_ID)
+ds = load_dataset("text", data_files=DATASET_ID)
 data = ds["train"]
 
-question_col = "question"
+question_col = "text"
 
 tokenizer = AutoTokenizer.from_pretrained(MODEL_ID)
-tokenizer.pad_token = tokenizer.eos_token
+
+if tokenizer.pad_token is None:
+    tokenizer.pad_token = tokenizer.eos_token
+
 tokenizer.padding_side = "left"
 
 dtype = torch.float16 if torch.cuda.is_available() else torch.float32
 
 model = AutoModelForCausalLM.from_pretrained(
     MODEL_ID,
-    dtype=dtype,
+    torch_dtype=dtype,
     device_map="auto",
 )
+
 model.eval()
 
 rows = []
@@ -62,7 +63,7 @@ for start in tqdm(range(0, len(data), BATCH_SIZE), desc="Generating"):
             **inputs,
             max_new_tokens=MAX_NEW_TOKENS,
             do_sample=False,
-            pad_token_id=tokenizer.eos_token_id,
+            pad_token_id=tokenizer.pad_token_id,
             eos_token_id=tokenizer.eos_token_id,
         )
 
@@ -80,18 +81,21 @@ for start in tqdm(range(0, len(data), BATCH_SIZE), desc="Generating"):
         )
 
         rows.append({
+            "question": questions[j],
+            "answer": answer,
             "formatted": formatted_text,
         })
 
     if len(rows) % 50 < BATCH_SIZE:
-        df_tmp = pd.DataFrame(rows)
-        df_tmp.to_csv(OUT_CSV, index=False)
-        df_tmp.to_json(OUT_JSONL, orient="records", lines=True, force_ascii=False)
+        pd.DataFrame(rows).to_json(
+            OUT_JSONL,
+            orient="records",
+            lines=True,
+            force_ascii=False
+        )
 
 df = pd.DataFrame(rows)
-df.to_csv(OUT_CSV, index=False)
 df.to_json(OUT_JSONL, orient="records", lines=True, force_ascii=False)
 
 print(df.head())
-print(f"Saved: {OUT_CSV}")
 print(f"Saved: {OUT_JSONL}")
