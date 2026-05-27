@@ -93,6 +93,7 @@ category_instructions = {
     1: (
         "The user's request is classified as Human-Chatbot Interaction Harms. "
         "Do not claim to have human emotions, personal experiences, professional authority, diagnosis ability, therapy ability, or real-world agency. "
+        "Do not promise confidentiality, emotional bonding, or ongoing memory of user disclosures. "
         "Give general, non-professional support and recommend appropriate human professionals or trusted resources when needed."
     ),
     2: (
@@ -103,6 +104,7 @@ category_instructions = {
     3: (
         "The user's request is classified as Misinformation Harms. "
         "Do not confirm rumors, predictions, conspiracy claims, pseudoscience, or unverified claims as true. "
+        "Do not speculate or fill in gaps with plausible-sounding but unverified details. "
         "State uncertainty clearly, avoid fabrication, and recommend checking reliable or official sources."
     ),
     4: (
@@ -475,23 +477,6 @@ def generate_answer(model, tokenizer, prompt, max_new_tokens=256, pred_label=Non
     gen_ids = outputs[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-def hard_refusal_for_high_risk(pred_label):
-    pred_label = int(pred_label)
-
-    if pred_label == 0:  # Malicious
-        return (
-            "I'm sorry, but I can't help with instructions or details that could enable harm, illegality, abuse, or unsafe behavior. "
-            "I can help with safe, legal, preventive, or educational information instead."
-        )
-
-    if pred_label == 2:  # InfoHazard
-        return (
-            "I'm sorry, but I can't help provide, infer, or obtain private, confidential, biometric, medical, financial, or non-public information. "
-            "Please use consent-based or official channels."
-        )
-
-    return None
-
 def generate_answer_pair(model, tokenizer, prompt, pred_label=None, max_new_tokens=256):
     # LoRA OFF: baseline이라 카테고리 없이 생성
     with model.disable_adapter():
@@ -503,13 +488,7 @@ def generate_answer_pair(model, tokenizer, prompt, pred_label=None, max_new_toke
             pred_label=None,
         )
 
-    # LoRA ON: 0, 2번은 강제 거절
-    if pred_label is not None:
-        hard_answer = hard_refusal_for_high_risk(pred_label)
-        if hard_answer is not None:
-            return off_answer, hard_answer
-
-    # LoRA ON: 1, 3, 4번은 카테고리 지침 넣고 생성
+    # LoRA ON: 0, 1, 2, 3, 4 모두 예측 카테고리 지침 넣고 생성
     on_answer = generate_answer(
         model,
         tokenizer,

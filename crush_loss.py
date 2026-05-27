@@ -144,7 +144,7 @@ class FixedCentroidHolder:
 def calc_crush_loss(h_benign_orig, h_benign_new,
                     h_harmful_orig, h_harmful_new,
                     labels, centroids,
-                    m_b=0.5, m_pull=0.5, m_push=0.5):
+                    m_b=0.5, m_pull=0.5, m_push=2.0):
     """
     CRUSH Loss 계산.
 

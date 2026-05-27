@@ -41,9 +41,9 @@ from sklearn.metrics import pairwise_distances
 # =========================================================
 # 설정
 # =========================================================
-#BASE_MODEL = "Qwen/Qwen2-0.5B-Instruct"
+BASE_MODEL = "Qwen/Qwen2-0.5B-Instruct"
 #BASE_MODEL = "google/gemma-2-2b-it"
-BASE_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
+#BASE_MODEL = "meta-llama/Llama-3.2-3B-Instruct"
 LORA_PATH = "./out/test"
 CENTROIDS_PATH = "./out/test/crush_centroids.pt"
 INIT_CENTROIDS_PATH = "./out/test/crush_centroids_initial.pt"  # cluster_layer 정보 포함

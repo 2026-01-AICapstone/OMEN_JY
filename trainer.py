@@ -357,7 +357,7 @@ def _calc_loss(self, model, safe_inputs, unsafe_inputs, retain_inputs,
                 h_sa_orig, h_sa_new,
                 h_un_orig_dna, h_un_new_dna,
                 labels, current_centroids,
-                m_b=0.5, m_pull=0.5, m_push=0.5
+                m_b=0.5, m_pull=0.5, m_push=2.0
             )
 
             crush_benign_loss += l_b
