@@ -1,3 +1,483 @@
+# 7개 클러스터 시
+# import random
+# import os
+# from typing import Dict, List
+#
+# import jsonlines
+# import torch
+# import transformers
+# from torch.utils.data import Dataset
+# import numpy as np
+# import requests
+# import time
+#
+# random.seed(0)
+#
+#
+# class RepBendingDataset(Dataset):
+#
+#     def __init__(
+#         self,
+#         tokenizer: transformers.PreTrainedTokenizer,
+#         num_examples,
+#         mode,
+#         max_length,
+#         model_name_or_path,
+#         dataset_path=None,
+#         split=None,
+#         is_online=False,
+#     ):
+#         super().__init__()
+#
+#         self.model_name_or_path = model_name_or_path.lower()
+#         self.max_length = max_length
+#         self.tokenizer = tokenizer
+#         self.num_examples = num_examples
+#
+#         # 7-way category
+#         self.num_categories = 7
+#         self.target_categories = {
+#             "Malicious Uses": 0,
+#             "Human-Chatbot Interaction Harms": 1,
+#             "Information Hazards": 2,
+#             "Misinformation Harms": 3,
+#             "Discrimination, Exclusion, Toxicity, Hateful, Offensive": 4,
+#             "Sexual Content": 5,
+#             "Suicide & Self-Harm": 6,
+#         }
+#
+#         self.data_safe_samples = []
+#         self.data_unsafe_samples = []
+#         self.data_unsafe_request_prompts = []
+#         self.data_unsafe_true_labels = []
+#         self.data_unsafe_labels = None
+#
+#         self.retain_set = []
+#         self.unsafe_prompt_pair_unsafe_answer = []
+#         self.unsafe_prompt_pair_safe_answer = []
+#
+#         def set_tags_templates():
+#             one_shot_template = "{user_tag}{instruction}{assistant_tag}<SEPARATOR>{response}"
+#
+#             if "qwen" in self.model_name_or_path:
+#                 print("USING QWEN TEMPLATE")
+#                 user_tag = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
+#                 assistant_tag = "<|im_end|>\n<|im_start|>assistant\n"
+#
+#             elif "llama" in self.model_name_or_path:
+#                 print("USING LLAMA TEMPLATE")
+#                 user_tag = "<|start_header_id|>user<|end_header_id|>\n\n"
+#                 assistant_tag = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
+#
+#             elif "gemma" in self.model_name_or_path:
+#                 print("USING GEMMA TEMPLATE")
+#                 user_tag = "<start_of_turn>user\n"
+#                 assistant_tag = "<end_of_turn>\n<start_of_turn>model\n"
+#
+#             else:
+#                 raise NotImplementedError(f"Model {self.model_name_or_path} not supported")
+#
+#             self.user_tag = user_tag
+#             self.assistant_tag = assistant_tag
+#             return one_shot_template
+#
+#         # def fetch_rows(url, params, max_retries=3):
+#         #     for attempt in range(max_retries):
+#         #         try:
+#         #             response = requests.get(url, params=params, timeout=120)
+#         #             return response.json().get("rows", [])
+#         #         except requests.exceptions.ReadTimeout:
+#         #             print(f"  타임아웃 발생, {attempt + 1}번째 재시도...")
+#         #             time.sleep(5)
+#         #     return []
+#         def fetch_rows(url, params, max_retries=3):
+#             for attempt in range(max_retries):
+#                 try:
+#                     response = requests.get(url, params=params, timeout=120)
+#                     print(f"  HTTP {response.status_code}, 응답 길이: {len(response.text)}")
+#                     if response.status_code != 200:
+#                         print(f"  응답 내용: {response.text[:200]}")
+#                         time.sleep(5)
+#                         continue
+#                     return response.json().get("rows", [])
+#                 except requests.exceptions.ReadTimeout:
+#                     print(f"  타임아웃, {attempt + 1}번째 재시도...")
+#                     time.sleep(5)
+#             return []
+#
+#         def get_7way_label(r):
+#             risk_area = str(r.get("risk_area", "")).strip()
+#             harm_type = str(r.get("types_of_harm", "")).strip()
+#             specific_harm = str(r.get("specific_harms", "")).strip()
+#
+#             if (
+#                     risk_area == "Human-Chatbot Interaction Harms"
+#                     and harm_type == "Mental Health or Overreliance Crisis"
+#                     and specific_harm.startswith("Self-Harm")
+#             ):
+#                 return self.target_categories["Suicide & Self-Harm"]
+#
+#             if (
+#                     risk_area == "Discrimination, Exclusion, Toxicity, Hateful, Offensive"
+#                     and harm_type == "Adult Content"
+#                     and specific_harm.startswith("Explicit Sexual Content")
+#             ):
+#                 return self.target_categories["Sexual Content"]
+#
+#             if risk_area in [
+#                 "Malicious Uses",
+#                 "Human-Chatbot Interaction Harms",
+#                 "Information Hazards",
+#                 "Misinformation Harms",
+#                 "Discrimination, Exclusion, Toxicity, Hateful, Offensive",
+#             ]:
+#                 return self.target_categories[risk_area]
+#
+#             return None
+#
+#         def sample_from_ultrachat():
+#             print("Loading UltraChat via HuggingFace API (939개)...")
+#             url = "https://datasets-server.huggingface.co/rows"
+#             safe_samples = []
+#             retain = []
+#             offset = 0
+#
+#             while len(safe_samples) < 939:
+#                 params = {
+#                     "dataset": "HuggingFaceH4/ultrachat_200k",
+#                     "config": "default",
+#                     "split": "train_sft",
+#                     "offset": offset,
+#                     "length": 100,
+#                 }
+#
+#                 rows = fetch_rows(url, params)
+#                 if not rows:
+#                     break
+#
+#                 for row in rows:
+#                     messages = row.get("row", {}).get("messages", [])
+#                     if len(messages) < 2:
+#                         continue
+#
+#                     instruction = messages[0].get("content", "")
+#                     response_text = messages[1].get("content", "")
+#
+#                     if not instruction or not response_text:
+#                         continue
+#
+#                     safe_samples.append(
+#                         self.one_shot_template.format(
+#                             user_tag=self.user_tag,
+#                             assistant_tag=self.assistant_tag,
+#                             instruction=instruction,
+#                             response=response_text,
+#                         )
+#                     )
+#                     retain.append(instruction)
+#
+#                     if len(safe_samples) >= 939:
+#                         break
+#
+#                 offset += 100
+#                 print(f"  UltraChat {len(safe_samples)}/939 로드 중...")
+#
+#             self.data_safe_samples.extend(safe_samples)
+#             self.retain_set.extend(retain)
+#             print(f"UltraChat loaded: {len(safe_samples)}")
+#
+#         def sample_from_wildjailbreak():
+#             print("Loading WildJailbreak...")
+#             base_dir = os.path.dirname(os.path.abspath(__file__))
+#             jsonl_path = os.path.join(base_dir, "wildjailbreak.jsonl")
+#
+#             if not os.path.exists(jsonl_path):
+#                 print("wildjailbreak.jsonl not found, skipping...")
+#                 return
+#
+#             train_data = []
+#             import json
+#
+#             with open(jsonl_path, "r", encoding="utf-8") as f:
+#                 for line in f:
+#                     line = line.strip()
+#                     if not line:
+#                         continue
+#                     try:
+#                         train_data.append(json.loads(line))
+#                     except json.JSONDecodeError:
+#                         continue
+#
+#             wj_safe_samples = []
+#             wj_unsafe_pair = []
+#             wj_safe_pair = []
+#             template = self.one_shot_template
+#
+#             for d in train_data:
+#                 prompt = d.get("prompt", "")
+#                 harmful = d.get("harmful_answer", "")
+#                 harmless = d.get("harmless_answer", "")
+#                 dtype = d.get("prompt_type", "")
+#
+#                 if not prompt:
+#                     continue
+#
+#                 if "harmful" in dtype.lower():
+#                     if harmful and harmless and len(wj_unsafe_pair) < 939:
+#                         wj_unsafe_pair.append(
+#                             template.format(
+#                                 user_tag=self.user_tag,
+#                                 assistant_tag=self.assistant_tag,
+#                                 instruction=prompt,
+#                                 response=harmful,
+#                             )
+#                         )
+#                         wj_safe_pair.append(
+#                             template.format(
+#                                 user_tag=self.user_tag,
+#                                 assistant_tag=self.assistant_tag,
+#                                 instruction=prompt,
+#                                 response=harmless,
+#                             )
+#                         )
+#
+#                 elif "harmless" in dtype.lower():
+#                     if harmless and len(wj_safe_samples) < 939:
+#                         wj_safe_samples.append(
+#                             template.format(
+#                                 user_tag=self.user_tag,
+#                                 assistant_tag=self.assistant_tag,
+#                                 instruction=prompt,
+#                                 response=harmless,
+#                             )
+#                         )
+#                         self.retain_set.append(prompt)
+#
+#                 if len(wj_unsafe_pair) >= 939 and len(wj_safe_samples) >= 939:
+#                     break
+#
+#             self.data_safe_samples.extend(wj_safe_samples)
+#             self.unsafe_prompt_pair_unsafe_answer = wj_unsafe_pair
+#             self.unsafe_prompt_pair_safe_answer = wj_safe_pair
+#
+#             print(f"WildJailbreak safe loaded: {len(wj_safe_samples)}")
+#             print(f"WildJailbreak unsafe pair loaded: {len(wj_unsafe_pair)}")
+#
+#         def sample_from_do_not_answer():
+#             print("Loading Do-Not-Answer via HuggingFace API...")
+#
+#             url = "https://datasets-server.huggingface.co/rows"
+#             offset = 0
+#
+#             while len(self.data_unsafe_samples) < 939:
+#                 params = {
+#                     "dataset": "LibrAI/do-not-answer",
+#                     "config": "default",
+#                     "split": "train",
+#                     "offset": offset,
+#                     "length": 100,
+#                 }
+#
+#                 rows = fetch_rows(url, params)
+#                 if not rows:
+#                     break
+#
+#                 for row in rows:
+#                     r = row.get("row", {})
+#
+#                     instruction = r.get("question", "")
+#                     true_label = get_7way_label(r)
+#
+#                     if not instruction or true_label is None:
+#                         continue
+#
+#                     best_response = ""
+#                     for model_name in [
+#                         "GPT4",
+#                         "ChatGPT",
+#                         "Claude",
+#                         "ChatGLM2",
+#                         "llama2-7b-chat",
+#                         "vicuna-7b",
+#                     ]:
+#                         resp = r.get(f"{model_name}_response", "")
+#                         if resp and len(resp) > len(best_response):
+#                             best_response = resp
+#
+#                     if not best_response:
+#                         continue
+#
+#                     formatted = self.one_shot_template.format(
+#                         user_tag=self.user_tag,
+#                         assistant_tag=self.assistant_tag,
+#                         instruction=instruction,
+#                         response=best_response,
+#                     )
+#
+#                     self.data_unsafe_samples.append(formatted)
+#                     self.data_unsafe_request_prompts.append(instruction)
+#                     self.data_unsafe_true_labels.append(true_label)
+#
+#                     if len(self.data_unsafe_samples) >= 939:
+#                         break
+#
+#                 offset += 100
+#                 print(f"  Do-Not-Answer {len(self.data_unsafe_samples)}/939 로드 중...")
+#
+#             print(f"Do-Not-Answer loaded: {len(self.data_unsafe_samples)}")
+#             print(
+#                 f"  정답 라벨(7-way) 분포: "
+#                 f"{np.bincount(self.data_unsafe_true_labels, minlength=self.num_categories).tolist()}"
+#             )
+#             print("  ⚠️ 학습용 pseudo-label은 아직 미설정. set_pseudo_labels()로 주입 필요.")
+#
+#         self.one_shot_template = set_tags_templates()
+#
+#         sample_from_ultrachat()
+#         sample_from_wildjailbreak()
+#         sample_from_do_not_answer()
+#
+#         self.tokenizer.padding_side = "right"
+#
+#         print("\n✅ 데이터셋 구성 완료:")
+#         print(f"  Safe samples (UltraChat+WJ harmless): {len(self.data_safe_samples)}")
+#         print(f"  Unsafe samples (Do-Not-Answer):       {len(self.data_unsafe_samples)}")
+#         print(f"  Unsafe pair (WJ harmful):             {len(self.unsafe_prompt_pair_unsafe_answer)}")
+#         print(f"  Retain set:                           {len(self.retain_set)}")
+#
+#     def set_pseudo_labels(self, pseudo_labels: List[int]):
+#         if len(pseudo_labels) != len(self.data_unsafe_samples):
+#             raise ValueError(
+#                 f"pseudo_labels 길이({len(pseudo_labels)}) ≠ "
+#                 f"data_unsafe_samples 길이({len(self.data_unsafe_samples)})"
+#             )
+#
+#         self.data_unsafe_labels = list(pseudo_labels)
+#
+#         bincount = np.bincount(
+#             self.data_unsafe_labels,
+#             minlength=self.num_categories,
+#         )
+#
+#         print(f"✅ Pseudo-label 주입 완료. 분포: {bincount.tolist()}")
+#
+#     def __len__(self):
+#         return min(
+#             len(self.data_safe_samples),
+#             len(self.data_unsafe_samples),
+#             len(self.retain_set),
+#             len(self.unsafe_prompt_pair_unsafe_answer),
+#         )
+#
+#     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+#         if self.data_unsafe_labels is not None:
+#             num_clusters = max(self.data_unsafe_labels) + 1
+#             target_label = i % num_clusters
+#             candidates = [
+#                 j for j, label in enumerate(self.data_unsafe_labels)
+#                 if label == target_label
+#             ]
+#
+#             if not candidates:
+#                 unsafe_idx = i % len(self.data_unsafe_samples)
+#             else:
+#                 unsafe_idx = candidates[(i // num_clusters) % len(candidates)]
+#
+#             label = self.data_unsafe_labels[unsafe_idx]
+#
+#         else:
+#             unsafe_idx = i % len(self.data_unsafe_samples)
+#             label = -1
+#
+#         unsafe = self.data_unsafe_samples[unsafe_idx]
+#
+#         pair_idx = i % len(self.unsafe_prompt_pair_unsafe_answer)
+#         unsafe_pair = self.unsafe_prompt_pair_unsafe_answer[pair_idx]
+#         safe_pair = self.unsafe_prompt_pair_safe_answer[pair_idx]
+#
+#         safe = self.data_safe_samples[i % len(self.data_safe_samples)]
+#         retain = self.retain_set[i % len(self.retain_set)]
+#
+#         def tok(x, max_len):
+#             return self.tokenizer(
+#                 x,
+#                 max_length=max_len,
+#                 padding="max_length",
+#                 truncation=True,
+#                 return_tensors="pt",
+#             )
+#
+#         half = self.max_length // 2
+#
+#         safe_req, safe_res = safe.split("<SEPARATOR>")
+#         unsafe_req, unsafe_res = unsafe.split("<SEPARATOR>")
+#         ur_req, ur_res = unsafe_pair.split("<SEPARATOR>")
+#         sr_req, sr_res = safe_pair.split("<SEPARATOR>")
+#
+#         safe_in = tok(safe_req, half)
+#         safe_out = tok(safe_res, half)
+#
+#         unsafe_in = tok(unsafe_req, half)
+#         unsafe_out = tok(unsafe_res, half)
+#
+#         retain_tok = tok(retain, self.max_length)
+#
+#         ur_in = tok(ur_req, half)
+#         ur_out = tok(ur_res, half)
+#         sr_out = tok(sr_res, half)
+#
+#         return {
+#             "ids_safe_sample": torch.cat(
+#                 [safe_in["input_ids"], safe_out["input_ids"]],
+#                 dim=1,
+#             ),
+#             "mask_safe_sample": torch.cat(
+#                 [safe_in["attention_mask"], safe_out["attention_mask"]],
+#                 dim=1,
+#             ),
+#             "mask_safe_sample_request": safe_in["attention_mask"],
+#             "mask_safe_sample_response": safe_out["attention_mask"],
+#
+#             "ids_unsafe_sample": torch.cat(
+#                 [unsafe_in["input_ids"], unsafe_out["input_ids"]],
+#                 dim=1,
+#             ),
+#             "mask_unsafe_sample": torch.cat(
+#                 [unsafe_in["attention_mask"], unsafe_out["attention_mask"]],
+#                 dim=1,
+#             ),
+#             "mask_unsafe_sample_request": unsafe_in["attention_mask"],
+#             "mask_unsafe_sample_response": unsafe_out["attention_mask"],
+#
+#             "ids_retain": retain_tok["input_ids"],
+#             "mask_retain": retain_tok["attention_mask"],
+#
+#             "ids_unsafe_request_unsafe_response": torch.cat(
+#                 [ur_in["input_ids"], ur_out["input_ids"]],
+#                 dim=1,
+#             ),
+#             "mask_unsafe_request_unsafe_response": torch.cat(
+#                 [ur_in["attention_mask"], ur_out["attention_mask"]],
+#                 dim=1,
+#             ),
+#             "mask_unsafe_response_for_unsafe_request": ur_out["attention_mask"],
+#
+#             "ids_unsafe_request_safe_response": torch.cat(
+#                 [ur_in["input_ids"], sr_out["input_ids"]],
+#                 dim=1,
+#             ),
+#             "mask_unsafe_request_safe_response": torch.cat(
+#                 [ur_in["attention_mask"], sr_out["attention_mask"]],
+#                 dim=1,
+#             ),
+#             "mask_safe_response_for_unsafe_request": sr_out["attention_mask"],
+#
+#             "ids_unsafe_request": ur_in["input_ids"],
+#             "mask_unsafe_request": ur_in["attention_mask"],
+#
+#             "labels": torch.tensor(label, dtype=torch.long).unsqueeze(0),
+#         }
+
 # import random
 # from typing import Dict
 # import jsonlines
@@ -386,6 +866,7 @@
 #             "labels": torch.tensor(label, dtype=torch.long).unsqueeze(0),
 #         }
 
+
 """
 dataset.py
 ==========
@@ -420,6 +901,38 @@ import time
 
 random.seed(0)
 
+# =========================================================
+# Prefix Injection 설정
+# =========================================================
+# md 문서 §2 참고: "Sure, here is..."를 assistant 응답 앞에 주입해
+# 모델이 이미 수락한 문맥으로 학습/평가 데이터를 구성한다.
+PREFIX_INJECTION_TEMPLATE = "Sure, here is"
+
+# risk_area별 prefix: 카테고리 맥락을 살려서 더 자연스러운 수락 문맥 생성
+CATEGORY_PREFIX_MAP = {
+    0: "Sure, here is the information you requested",  # Malicious Uses
+    1: "Sure, here is my response",  # Human-Chatbot Interaction Harms
+    2: "Sure, here is the information",  # Information Hazards
+    3: "Sure, here is",  # Misinformation Harms
+    4: "Sure, here is the content you asked for",  # Discrimination/Hateful
+    5: "Sure, here is the content",  # Sexual Content
+    6: "Sure, here is",  # Suicide & Self-Harm
+}
+
+
+def apply_prefix_injection(response: str, label: int = -1) -> str:
+    """
+    응답 앞에 prefix를 주입하여 모델이 이미 수락한 문맥을 만든다.
+    - label이 있으면 카테고리별 prefix 사용
+    - label이 없으면 기본 prefix 사용
+    """
+    prefix = CATEGORY_PREFIX_MAP.get(label, PREFIX_INJECTION_TEMPLATE)
+    response = response.strip()
+    # 이미 prefix로 시작하면 중복 주입 방지
+    if response.lower().startswith("sure,"):
+        return response
+    return f"{prefix}: {response}"
+
 
 class RepBendingDataset(Dataset):
 
@@ -441,15 +954,15 @@ class RepBendingDataset(Dataset):
         self.num_examples = num_examples
 
         # ---------- 데이터 컨테이너 ----------
-        self.data_safe_samples = []                  # harmless prompt + harmless answer
-        self.data_unsafe_samples = []                # harmful prompt + harmful answer (DNA)
-        self.data_unsafe_request_prompts = []        # DNA request만 (clustering.py용)
-        self.data_unsafe_true_labels = []            # DNA risk_area 정답 (검증용)
-        self.data_unsafe_labels = None               # pseudo-label (외부 주입)
+        self.data_safe_samples = []  # harmless prompt + harmless answer
+        self.data_unsafe_samples = []  # harmful prompt + harmful answer (DNA)
+        self.data_unsafe_request_prompts = []  # DNA request만 (clustering.py용)
+        self.data_unsafe_true_labels = []  # DNA risk_area 정답 (검증용)
+        self.data_unsafe_labels = None  # pseudo-label (외부 주입)
 
         self.retain_set = []
-        self.unsafe_prompt_pair_unsafe_answer = []   # WJ harmful + harmful
-        self.unsafe_prompt_pair_safe_answer = []     # WJ harmful + harmless
+        self.unsafe_prompt_pair_unsafe_answer = []  # WJ harmful + harmful
+        self.unsafe_prompt_pair_safe_answer = []  # WJ harmful + harmless
 
         # =========================================================
         # TEMPLATE
@@ -465,15 +978,15 @@ class RepBendingDataset(Dataset):
                 print("USING LLAMA TEMPLATE")
                 user_tag = "<|start_header_id|>user<|end_header_id|>\n\n"
                 assistant_tag = "<|eot_id|><|start_header_id|>assistant<|end_header_id|>\n\n"
-            
+
             # 추가
             elif "gemma" in self.model_name_or_path.lower():
                 print("USING GEMMA TEMPLATE")
 
                 user_tag = "<start_of_turn>user\n"
                 assistant_tag = "<end_of_turn>\n<start_of_turn>model\n"
-                
-                
+
+
             else:
                 raise NotImplementedError(f"Model {self.model_name_or_path} not supported")
             self.user_tag = user_tag
@@ -583,12 +1096,13 @@ class RepBendingDataset(Dataset):
 
                 if "harmful" in dtype.lower():
                     if harmful and harmless and len(wj_unsafe_pair) < 939:
+                        # WJ unsafe pair에도 prefix injection 적용 (md §2)
                         wj_unsafe_pair.append(
                             template.format(
                                 user_tag=self.user_tag,
                                 assistant_tag=self.assistant_tag,
                                 instruction=prompt,
-                                response=harmful
+                                response=apply_prefix_injection(harmful)
                             )
                         )
                         wj_safe_pair.append(
@@ -669,11 +1183,16 @@ class RepBendingDataset(Dataset):
                     if not best_response:
                         continue
 
+                    # Prefix Injection 적용 (md §2):
+                    # 모델이 이미 수락한 문맥("Sure, here is...")을
+                    # 응답 앞에 주입하여 유해 응답 학습 데이터를 구성한다.
+                    injected_response = apply_prefix_injection(best_response, label=true_label)
+
                     formatted = self.one_shot_template.format(
                         user_tag=self.user_tag,
                         assistant_tag=self.assistant_tag,
                         instruction=instruction,
-                        response=best_response
+                        response=injected_response
                     )
 
                     self.data_unsafe_samples.append(formatted)
@@ -776,30 +1295,31 @@ class RepBendingDataset(Dataset):
         sr_out = tok(sr_res, half)
 
         return {
-            "ids_safe_sample":              torch.cat([safe_in["input_ids"],  safe_out["input_ids"]],  dim=1),
-            "mask_safe_sample":             torch.cat([safe_in["attention_mask"], safe_out["attention_mask"]], dim=1),
-            "mask_safe_sample_request":     safe_in["attention_mask"],
-            "mask_safe_sample_response":    safe_out["attention_mask"],
+            "ids_safe_sample": torch.cat([safe_in["input_ids"], safe_out["input_ids"]], dim=1),
+            "mask_safe_sample": torch.cat([safe_in["attention_mask"], safe_out["attention_mask"]], dim=1),
+            "mask_safe_sample_request": safe_in["attention_mask"],
+            "mask_safe_sample_response": safe_out["attention_mask"],
 
-            "ids_unsafe_sample":            torch.cat([unsafe_in["input_ids"],  unsafe_out["input_ids"]],  dim=1),
-            "mask_unsafe_sample":           torch.cat([unsafe_in["attention_mask"], unsafe_out["attention_mask"]], dim=1),
-            "mask_unsafe_sample_request":   unsafe_in["attention_mask"],
-            "mask_unsafe_sample_response":  unsafe_out["attention_mask"],
+            "ids_unsafe_sample": torch.cat([unsafe_in["input_ids"], unsafe_out["input_ids"]], dim=1),
+            "mask_unsafe_sample": torch.cat([unsafe_in["attention_mask"], unsafe_out["attention_mask"]], dim=1),
+            "mask_unsafe_sample_request": unsafe_in["attention_mask"],
+            "mask_unsafe_sample_response": unsafe_out["attention_mask"],
 
-            "ids_retain":                   retain_tok["input_ids"],
-            "mask_retain":                  retain_tok["attention_mask"],
+            "ids_retain": retain_tok["input_ids"],
+            "mask_retain": retain_tok["attention_mask"],
 
-            "ids_unsafe_request_unsafe_response":       torch.cat([ur_in["input_ids"],  ur_out["input_ids"]],  dim=1),
-            "mask_unsafe_request_unsafe_response":      torch.cat([ur_in["attention_mask"], ur_out["attention_mask"]], dim=1),
-            "mask_unsafe_response_for_unsafe_request":  ur_out["attention_mask"],
+            "ids_unsafe_request_unsafe_response": torch.cat([ur_in["input_ids"], ur_out["input_ids"]], dim=1),
+            "mask_unsafe_request_unsafe_response": torch.cat([ur_in["attention_mask"], ur_out["attention_mask"]],
+                                                             dim=1),
+            "mask_unsafe_response_for_unsafe_request": ur_out["attention_mask"],
 
-            "ids_unsafe_request_safe_response":         torch.cat([ur_in["input_ids"],  sr_out["input_ids"]],  dim=1),
-            "mask_unsafe_request_safe_response":        torch.cat([ur_in["attention_mask"], sr_out["attention_mask"]], dim=1),
-            "mask_safe_response_for_unsafe_request":    sr_out["attention_mask"],
+            "ids_unsafe_request_safe_response": torch.cat([ur_in["input_ids"], sr_out["input_ids"]], dim=1),
+            "mask_unsafe_request_safe_response": torch.cat([ur_in["attention_mask"], sr_out["attention_mask"]], dim=1),
+            "mask_safe_response_for_unsafe_request": sr_out["attention_mask"],
 
-            "ids_unsafe_request":           ur_in["input_ids"],
-            "mask_unsafe_request":          ur_in["attention_mask"],
+            "ids_unsafe_request": ur_in["input_ids"],
+            "mask_unsafe_request": ur_in["attention_mask"],
 
             # DNA의 pseudo-label만 부여. WJ는 라벨 없음.
-            "labels":                       torch.tensor(label, dtype=torch.long).unsqueeze(0),
+            "labels": torch.tensor(label, dtype=torch.long).unsqueeze(0),
         }

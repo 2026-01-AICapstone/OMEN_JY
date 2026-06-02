@@ -1,3 +1,557 @@
+#
+# 7개 클러스터 시
+# """
+# crush_loss.py
+# =============
+# CRUSH Loss (Cluster RUSH).
+#
+# 핵심 설계 변경 (이전 버전 대비):
+#   - EMA 기반 CentroidManager 폐기
+#   - Centroid는 학습 시작 전 1회 사전 계산 후 학습 내내 고정
+#   - FixedCentroidHolder는 단순히 텐서를 보관/이동만 담당
+#   - Margin 0.2 → 0.5 (단위 구 위 5개 점의 평균 거리가 ~1.58인 점 고려)
+#
+# Loss 구성:
+#   - Benign loss : safe 벡터가 원본보다 유해 클러스터에 가까워지면 패널티
+#   - Pull loss   : harmful 벡터가 자기 클러스터 centroid에 모이도록
+#   - Push loss   : harmful 벡터가 다른 클러스터 centroid에서 멀어지도록
+#
+# 연구 근거:
+#   - Khosla et al., "Supervised Contrastive Learning" (NeurIPS 2020)
+#   - Movshovitz-Attias et al., "Proxy NCA" (ICCV 2017)
+#   - Kim et al., "Proxy Anchor Loss" (CVPR 2020)
+#   → centroid/proxy를 hidden 평균 EMA가 아닌 사전 계산 또는 학습 가능 파라미터로 두는 것이 표준
+# """
+#
+# import torch
+# import torch.nn.functional as F
+#
+#
+# class FixedCentroidHolder:
+#     """
+#     학습 시작 전 사전 계산된 centroid를 보관/이동만 담당.
+#     EMA 업데이트 없음. 학습 내내 값 불변.
+#     """
+#
+#     def __init__(self, centroids: torch.Tensor):
+#         """
+#         Args:
+#             centroids: (K, hidden_size) torch.Tensor, 이미 L2 정규화된 상태로 들어와야 함
+#         """
+#         assert centroids.dim() == 2, f"centroids must be 2D, got {centroids.shape}"
+#         self.num_classes = centroids.size(0)
+#         self.hidden_size = centroids.size(1)
+#         # detach + clone으로 grad graph 완전 차단
+#         self.centroids = centroids.detach().clone()
+#
+#         # 정규화 검증
+#         norms = self.centroids.norm(p=2, dim=-1)
+#         if not torch.allclose(norms, torch.ones_like(norms), atol=1e-3):
+#             print(f"⚠️ centroids가 L2 정규화되지 않음 (norms={norms.tolist()}), 자동 정규화 적용")
+#             self.centroids = F.normalize(self.centroids, p=2, dim=-1)
+#
+#         print(f"✅ FixedCentroidHolder 초기화: {self.num_classes}개 centroid (hidden={self.hidden_size})")
+#
+#     def get(self, device=None, dtype=None):
+#         """학습 시 호출. 디바이스/dtype 맞춰서 반환."""
+#         c = self.centroids
+#         if device is not None and c.device != device:
+#             c = c.to(device)
+#             self.centroids = c  # 이후 호출에서 재이동 방지
+#         if dtype is not None and c.dtype != dtype:
+#             c = c.to(dtype)
+#         return c
+#
+#     def to(self, device):
+#         self.centroids = self.centroids.to(device)
+#         return self
+#
+#     def state_dict(self):
+#         return {"centroids": self.centroids}
+#
+#
+# def calc_crush_loss(h_benign_orig, h_benign_new,
+#                     h_harmful_orig, h_harmful_new,
+#                     labels, centroids,
+#                     m_b=0.5, m_pull=1.0, m_push=1.5):
+#     """
+#     CRUSH Loss 계산.
+#
+#     Args:
+#         h_benign_orig: (B_safe, H) 원본 safe hidden (no LoRA)
+#         h_benign_new:  (B_safe, H) LoRA 적용 후 safe hidden
+#         h_harmful_orig: (B_harm, H) 원본 harmful hidden (no LoRA)
+#         h_harmful_new:  (B_harm, H) LoRA 적용 후 harmful hidden
+#         labels: (B_harm,) 각 harmful 샘플의 클러스터 ID (pseudo-label)
+#         centroids: (K, H) 고정 centroid (L2 정규화 상태)
+#         m_b, m_pull, m_push: 각 loss의 margin
+#
+#     Returns:
+#         loss_benign, loss_pull, loss_push: 각각 scalar tensor
+#     """
+#     # ---------- L2 정규화 (단위 구 위에서 거리 계산) ----------
+#     if h_benign_orig.size(0) > 0:
+#         h_benign_orig = F.normalize(h_benign_orig.float(), p=2, dim=-1)
+#         h_benign_new = F.normalize(h_benign_new.float(), p=2, dim=-1)
+#
+#     if h_harmful_orig.size(0) > 0:
+#         h_harmful_orig = F.normalize(h_harmful_orig.float(), p=2, dim=-1)
+#         h_harmful_new = F.normalize(h_harmful_new.float(), p=2, dim=-1)
+#
+#     centroids = centroids.float()  # 이미 정규화 상태로 들어옴
+#
+#     batch_size_b = h_benign_new.size(0)
+#     batch_size_h = h_harmful_new.size(0)
+#     num_classes = centroids.size(0)
+#
+#     device = h_benign_new.device if batch_size_b > 0 else h_harmful_new.device
+#
+#     # =========================================================
+#     # Benign Loss
+#     # safe 벡터가 원본보다 가장 가까운 유해 클러스터에 더 가까워지면 패널티
+#     # =========================================================
+#     loss_benign = torch.tensor(0.0, device=device)
+#     if batch_size_b > 0:
+#         dist_orig_new_b = F.pairwise_distance(h_benign_orig, h_benign_new)
+#
+#         dists_to_centroids = torch.cdist(
+#             h_benign_new.unsqueeze(1),
+#             centroids.unsqueeze(0)
+#         ).squeeze(1)  # (B_safe, K)
+#
+#         min_dists, _ = torch.min(dists_to_centroids, dim=1)
+#         loss_benign_batch = F.relu(dist_orig_new_b - min_dists + m_b)
+#         loss_benign = loss_benign_batch.mean()
+#
+#     # =========================================================
+#     # Pull Loss / Push Loss
+#     # =========================================================
+#     loss_pull = torch.tensor(0.0, device=device)
+#     loss_push = torch.tensor(0.0, device=device)
+#
+#     if batch_size_h > 0:
+#         target_centroids = centroids[labels]  # (B_harm, H)
+#
+#         dist_to_my_centroid = F.pairwise_distance(h_harmful_new, target_centroids)
+#         dist_to_orig_h = F.pairwise_distance(h_harmful_new, h_harmful_orig)
+#
+#         # Pull: 자기 centroid까지 거리가 원본까지 거리보다 m_pull 이상 가까워야 함
+#         loss_pull_batch = F.relu(dist_to_my_centroid - dist_to_orig_h + m_pull)
+#         loss_pull = loss_pull_batch.mean()
+#
+#         # Push: 자기 centroid보다 가장 가까운 다른 centroid가 m_push 이상 멀어야 함
+#         dists_to_all = torch.cdist(h_harmful_new, centroids)  # (B_harm, K)
+#
+#         # 자기 클러스터 마스킹 (gradient-safe out-of-place)
+#         mask = F.one_hot(labels, num_classes=num_classes).bool()
+#         large_value = torch.full_like(dists_to_all, float('inf'))
+#         dists_to_all_masked = torch.where(mask, large_value, dists_to_all)
+#
+#         min_dists_other, _ = torch.min(dists_to_all_masked, dim=1)
+#         loss_push_batch = F.relu(dist_to_my_centroid - min_dists_other + m_push)
+#         loss_push = loss_push_batch.mean()
+#
+#     return loss_benign, loss_pull, loss_push
+
+
+# import random
+# from typing import Dict
+# import jsonlines
+# import torch
+# import transformers
+# from datasets import load_dataset
+# from torch.utils.data import Dataset
+# from sklearn.cluster import KMeans
+# from sklearn.feature_extraction.text import TfidfVectorizer
+# import numpy as np
+#
+# random.seed(0)
+#
+#
+# class RepBendingDataset(Dataset):
+#
+#     def __init__(self,
+#                  tokenizer: transformers.PreTrainedTokenizer,
+#                  num_examples,
+#                  mode,
+#                  max_length,
+#                  model_name_or_path,
+#                  dataset_path,
+#                  split=None,
+#                  is_online=False,
+#                  ):
+#         super().__init__()
+#
+#         self.model_name_or_path = model_name_or_path.lower()
+#         self.max_length = max_length
+#         self.tokenizer = tokenizer
+#         self.num_examples = num_examples
+#
+#         self.data_safe_samples = []
+#         self.data_unsafe_samples = []
+#         self.data_unsafe_labels = []
+#         self.retain_set = []
+#         self.unsafe_prompt_pair_unsafe_answer = []
+#         self.unsafe_prompt_pair_safe_answer = []
+#
+#         # =========================================================
+#         # TEMPLATE
+#         # =========================================================
+#         def set_tags_templates():
+#             one_shot_template = "{user_tag}{instruction}{assistant_tag}<SEPARATOR>{response}"
+#
+#             user_tag, assistant_tag = None, None
+#
+#             if "qwen" in self.model_name_or_path:
+#                 print("USING QWEN TEMPLATE")
+#                 user_tag = "<|im_start|>system\nYou are a helpful assistant.<|im_end|>\n<|im_start|>user\n"
+#                 assistant_tag = "<|im_end|>\n<|im_start|>assistant\n"
+#             elif "llama" in self.model_name_or_path:
+#                 print("USING LLAMA TEMPLATE")
+#                 user_tag = "<|user|>\n"
+#                 assistant_tag = "<|assistant|>\n"
+#             else:
+#                 raise NotImplementedError()
+#
+#             self.user_tag = user_tag
+#             self.assistant_tag = assistant_tag
+#             return one_shot_template
+#
+#         # =========================================================
+#         # ULTRACHAT (SAFE FIXED VERSION)
+#         # =========================================================
+#
+#         # def sample_from_ultrachat():
+#         #     print("Loading UltraChat (non-streaming mode)...")
+#         #
+#         #     ds = load_dataset(
+#         #         "HuggingFaceH4/ultrachat_200k",
+#         #         split=f"train_sft[:{self.num_examples * 3}]"  # 여유분 확보
+#         #     )
+#         #
+#         #     safe_samples = []
+#         #     retain = []
+#         #
+#         #     for example in ds:
+#         #         if len(safe_samples) >= self.num_examples:
+#         #             break
+#         #
+#         #         messages = example["messages"]
+#         #         if len(messages) < 2:
+#         #             continue
+#         #
+#         #         instruction = messages[0]["content"]
+#         #         response = messages[1]["content"]
+#         #
+#         #         safe_samples.append(
+#         #             self.one_shot_template.format(
+#         #                 user_tag=self.user_tag,
+#         #                 assistant_tag=self.assistant_tag,
+#         #                 instruction=instruction,
+#         #                 response=response
+#         #             )
+#         #         )
+#         #         retain.append(instruction)
+#         #
+#         #     self.data_safe_samples = safe_samples
+#         #     self.retain_set = retain
+#         #     print(f"UltraChat loaded: {len(safe_samples)}")
+#
+#         def sample_from_ultrachat():
+#             print("Loading safe samples via HuggingFace API...")
+#             import requests
+#
+#             url = "https://datasets-server.huggingface.co/rows"
+#             safe_samples = []
+#             retain = []
+#             batch_size = 100  # API 최대 허용치
+#
+#             offset = 0
+#             while len(safe_samples) < self.num_examples:
+#                 params = {
+#                     "dataset": "HuggingFaceH4/ultrachat_200k",
+#                     "config": "default",
+#                     "split": "train_sft",
+#                     "offset": offset,
+#                     "length": batch_size
+#                 }
+#
+#                 response = requests.get(url, params=params, timeout=60)
+#                 data = response.json()
+#                 rows = data.get("rows", [])
+#
+#                 if not rows:
+#                     break
+#
+#                 for row in rows:
+#                     messages = row.get("row", {}).get("messages", [])
+#                     if len(messages) < 2:
+#                         continue
+#
+#                     instruction = messages[0].get("content", "")
+#                     response_text = messages[1].get("content", "")
+#
+#                     if not instruction or not response_text:
+#                         continue
+#
+#                     safe_samples.append(
+#                         self.one_shot_template.format(
+#                             user_tag=self.user_tag,
+#                             assistant_tag=self.assistant_tag,
+#                             instruction=instruction,
+#                             response=response_text
+#                         )
+#                     )
+#                     retain.append(instruction)
+#
+#                     if len(safe_samples) >= self.num_examples:
+#                         break
+#
+#                 offset += batch_size
+#                 print(f"  {len(safe_samples)}/{self.num_examples} 로드 중...")
+#
+#             self.data_safe_samples = safe_samples
+#             self.retain_set = retain
+#             print(f"Safe samples loaded: {len(safe_samples)}")
+#
+#
+#
+#         # =========================================================
+#         # DO NOT ANSWER (SAFE LIMITED)
+#         # =========================================================
+#         def sample_from_do_not_answer_with_kmeans():
+#             print("Loading Do-Not-Answer via HuggingFace API...")
+#             import requests
+#             from sklearn.cluster import KMeans
+#             from sklearn.feature_extraction.text import TfidfVectorizer
+#
+#             url = "https://datasets-server.huggingface.co/rows"
+#             raw_unsafe = []
+#             raw_inst = []
+#             seed_dict = {}
+#
+#             offset = 0
+#             batch_size = 100
+#
+#             while len(raw_unsafe) < 500:
+#                 params = {
+#                     "dataset": "LibrAI/do-not-answer",
+#                     "config": "default",
+#                     "split": "train",
+#                     "offset": offset,
+#                     "length": batch_size
+#                 }
+#
+#                 response = requests.get(url, params=params, timeout=60)
+#                 data = response.json()
+#                 rows = data.get("rows", [])
+#
+#                 if not rows:
+#                     break
+#
+#                 for row in rows:
+#                     r = row.get("row", {})
+#                     instruction = r.get("question", r.get("prompt", ""))
+#                     response_text = r.get("response", "")
+#                     category = r.get("risk_area", "Unknown")
+#
+#                     if not instruction:
+#                         continue
+#
+#                     formatted = self.one_shot_template.format(
+#                         user_tag=self.user_tag,
+#                         assistant_tag=self.assistant_tag,
+#                         instruction=instruction,
+#                         response=response_text
+#                     )
+#
+#                     raw_unsafe.append(formatted)
+#                     raw_inst.append(instruction)
+#
+#                     if category not in seed_dict:
+#                         seed_dict[category] = instruction
+#
+#                     if len(raw_unsafe) >= 500:
+#                         break
+#
+#                 offset += batch_size
+#                 print(f"  Unsafe {len(raw_unsafe)}/500 로드 중...")
+#
+#             # KMeans 클러스터링
+#             vectorizer = TfidfVectorizer(max_features=1000)
+#             X = vectorizer.fit_transform(raw_inst)
+#
+#             pseudo_labels = KMeans(
+#                 n_clusters=5,
+#                 random_state=42,
+#                 n_init=1
+#             ).fit_predict(X)
+#
+#             self.data_unsafe_samples = raw_unsafe
+#             self.data_unsafe_labels = pseudo_labels.tolist()
+#
+#             print(f"Unsafe loaded: {len(raw_unsafe)}")
+#
+#         # =========================================================
+#         # WILDJAILBREAK (SAFE LIMITED)
+#         # =========================================================
+#         def sample_from_wildjailbreak():
+#             print("Loading WildJailbreak (safe 500)...")
+#
+#             train_data = []
+#
+#             try:
+#                 with jsonlines.open("./wildjailbreak.jsonl") as f:
+#                     for i, line in enumerate(f):
+#                         train_data.append(line)
+#                         if i >= 500:
+#                             break
+#             except:
+#                 print("wildjailbreak.jsonl not found")
+#                 return
+#
+#             unsafe_pair = []
+#             safe_pair = []
+#
+#             template = self.one_shot_template
+#
+#             for d in train_data:
+#
+#                 prompt = d.get("prompt", "")
+#                 harmful = d.get("harmful_answer", "")
+#                 harmless = d.get("harmless_answer", "")
+#                 dtype = d.get("prompt_type", "")
+#
+#                 if "harmful" in dtype.lower():
+#                     if harmful and harmless:
+#                         unsafe_pair.append(
+#                             template.format(
+#                                 user_tag=self.user_tag,
+#                                 assistant_tag=self.assistant_tag,
+#                                 instruction=prompt,
+#                                 response=harmful
+#                             )
+#                         )
+#
+#                         safe_pair.append(
+#                             template.format(
+#                                 user_tag=self.user_tag,
+#                                 assistant_tag=self.assistant_tag,
+#                                 instruction=prompt,
+#                                 response=harmless
+#                             )
+#                         )
+#
+#                 if len(unsafe_pair) >= 500:
+#                     break
+#
+#             self.unsafe_prompt_pair_unsafe_answer = unsafe_pair
+#             self.unsafe_prompt_pair_safe_answer = safe_pair
+#
+#             print(f"WildJailbreak loaded: {len(unsafe_pair)}")
+#
+#         # =========================================================
+#         # RUN PIPELINE
+#         # =========================================================
+#         self.one_shot_template = set_tags_templates()
+#
+#         sample_from_ultrachat()
+#         sample_from_do_not_answer_with_kmeans()
+#         sample_from_wildjailbreak()
+#
+#         self.tokenizer.padding_side = "right"
+#
+#     # =========================================================
+#     def __len__(self):
+#         return min(
+#             len(self.data_safe_samples),
+#             len(self.data_unsafe_samples),
+#             len(self.retain_set),
+#             len(self.unsafe_prompt_pair_unsafe_answer)
+#         )
+#
+#     # =========================================================
+#     def __getitem__(self, i) -> Dict[str, torch.Tensor]:
+#         safe = self.data_safe_samples[i]
+#         unsafe = self.data_unsafe_samples[i]
+#         label = self.data_unsafe_labels[i]
+#         retain = self.retain_set[i]
+#         unsafe_pair = self.unsafe_prompt_pair_unsafe_answer[i]
+#         safe_pair = self.unsafe_prompt_pair_safe_answer[i]
+#
+#         def tok(x, max_len):
+#             return self.tokenizer(
+#                 x,
+#                 max_length=max_len,
+#                 padding="max_length",
+#                 truncation=True,
+#                 return_tensors="pt"
+#             )
+#
+#         half = self.max_length // 2
+#
+#         # <SEPARATOR> 기준으로 request/response 분리
+#         safe_req, safe_res = safe.split("<SEPARATOR>")
+#         unsafe_req, unsafe_res = unsafe.split("<SEPARATOR>")
+#         ur_req, ur_res = unsafe_pair.split("<SEPARATOR>")  # unsafe request + unsafe response
+#         sr_req, sr_res = safe_pair.split("<SEPARATOR>")  # unsafe request + safe response
+#
+#         # 토크나이징
+#         safe_in = tok(safe_req, half)
+#         safe_out = tok(safe_res, half)
+#         unsafe_in = tok(unsafe_req, half)
+#         unsafe_out = tok(unsafe_res, half)
+#         retain_tok = tok(retain, self.max_length)
+#         ur_in = tok(ur_req, half)
+#         ur_out = tok(ur_res, half)
+#         sr_out = tok(sr_res, half)
+#
+#         return {
+#             # safe sample (safe request + safe response)
+#             "ids_safe_sample": torch.cat([safe_in["input_ids"], safe_out["input_ids"]], dim=1),
+#             "mask_safe_sample": torch.cat([safe_in["attention_mask"], safe_out["attention_mask"]], dim=1),
+#             "mask_safe_sample_request": safe_in["attention_mask"],
+#             "mask_safe_sample_response": safe_out["attention_mask"],
+#
+#             # unsafe sample (unsafe request + unsafe response)
+#             "ids_unsafe_sample": torch.cat([unsafe_in["input_ids"], unsafe_out["input_ids"]], dim=1),
+#             "mask_unsafe_sample": torch.cat([unsafe_in["attention_mask"], unsafe_out["attention_mask"]], dim=1),
+#             "mask_unsafe_sample_request": unsafe_in["attention_mask"],
+#             "mask_unsafe_sample_response": unsafe_out["attention_mask"],
+#
+#             # retain set (일반 지식 보존용)
+#             "ids_retain": retain_tok["input_ids"],
+#             "mask_retain": retain_tok["attention_mask"],
+#
+#             # unsafe request + unsafe response 쌍
+#             "ids_unsafe_request_unsafe_response": torch.cat([ur_in["input_ids"], ur_out["input_ids"]], dim=1),
+#             "mask_unsafe_request_unsafe_response": torch.cat([ur_in["attention_mask"], ur_out["attention_mask"]],
+#                                                              dim=1),
+#             "mask_unsafe_response_for_unsafe_request": ur_out["attention_mask"],
+#
+#             # unsafe request + safe response 쌍
+#             "ids_unsafe_request_safe_response": torch.cat([ur_in["input_ids"], sr_out["input_ids"]], dim=1),
+#             "mask_unsafe_request_safe_response": torch.cat([ur_in["attention_mask"], sr_out["attention_mask"]], dim=1),
+#             "mask_safe_response_for_unsafe_request": sr_out["attention_mask"],
+#
+#             # unsafe request 단독
+#             "ids_unsafe_request": ur_in["input_ids"],
+#             "mask_unsafe_request": ur_in["attention_mask"],
+#
+#             # CRUSH 클러스터 라벨
+#             "labels": torch.tensor(label, dtype=torch.long).unsqueeze(0),
+#         }
+
+
+
+
+
+
+
+
+
+
+
 # import torch
 # import torch.nn.functional as F
 #
@@ -144,7 +698,7 @@ class FixedCentroidHolder:
 def calc_crush_loss(h_benign_orig, h_benign_new,
                     h_harmful_orig, h_harmful_new,
                     labels, centroids,
-                    m_b=0.5, m_pull=0.5, m_push=2.0):
+                    m_b=0.5, m_pull=1.0, m_push=1.5):
     """
     CRUSH Loss 계산.
 

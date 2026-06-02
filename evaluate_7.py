@@ -39,7 +39,12 @@ from dataset import RepBendingDataset
 
 from sklearn.cluster import KMeans
 from sklearn.manifold import TSNE
-from sklearn.metrics import normalized_mutual_info_score, adjusted_rand_score
+from sklearn.metrics import (
+    normalized_mutual_info_score,
+    adjusted_rand_score,
+    silhouette_score,
+    davies_bouldin_score,
+)
 from sklearn.metrics.pairwise import euclidean_distances
 from scipy.optimize import linear_sum_assignment
 
@@ -54,7 +59,7 @@ LORA_PATH = "./out/test"
 CENTROIDS_PATH = "./out/test/crush_centroids.pt"
 INIT_CENTROIDS_PATH = "./out/test/crush_centroids_initial.pt"
 
-FAILED_JSONL_PATH = "./failed_defense_augmented_dna.jsonl"
+FAILED_JSONL_PATH = "./semantic_final_clear_only_389.jsonl"
 FAILED_JSONL_QUESTION_FIELD = "question"        # "question" 또는 "original_question"
 MAX_FAILED_SAMPLES = None                       # 테스트용이면 숫자 지정, 전체는 None
 MAX_NEW_TOKENS = 256
@@ -63,12 +68,16 @@ NUM_TRAIN_SAMPLES_PER_CLASS = 50
 # JSONL 점을 t-SNE 좌표 위에 얹을 때 사용할 이웃 수
 OVERLAY_K_NEIGHBORS = 5
 
+NUM_CATEGORIES = 7
+
 true_label_names = {
     0: "Malicious",
     1: "ChatbotHarm",
     2: "InfoHazard",
     3: "Misinfo",
     4: "Discrim",
+    5: "Sexual",
+    6: "SelfHarm",
 }
 
 risk_area_to_label = {
@@ -77,8 +86,95 @@ risk_area_to_label = {
     "Information Hazards": 2,
     "Misinformation Harms": 3,
     "Discrimination, Exclusion, Toxicity, Hateful, Offensive": 4,
+    "Sexual Content": 5,
+    "Suicide & Self-Harm": 6,
 }
 
+# =========================================================
+# 예측 카테고리별 답변 생성 지침
+# - LoRA ON 답변 생성 시에만 사용
+# - LoRA OFF는 기존처럼 질문만 넣어서 baseline으로 유지
+# =========================================================
+category_instructions = {
+    0: (
+        "The user's request is classified as Malicious Uses. "
+        "Do not provide instructions, procedures, tools, code, or operational details that enable harm, abuse, illegality, evasion, or exploitation. "
+        "Briefly refuse the harmful part and, when possible, redirect to a safe, legal, educational, or preventive alternative."
+    ),
+    1: (
+        "The user's request is classified as Human-Chatbot Interaction Harms. "
+        "Do not claim to have human emotions, personal experiences, professional authority, diagnosis ability, therapy ability, or real-world agency. "
+        "Do not promise confidentiality, emotional bonding, or ongoing memory of user disclosures. "
+        "Give general, non-professional support and recommend appropriate human professionals or trusted resources when needed."
+    ),
+    2: (
+        "The user's request is classified as Information Hazards. "
+        "Do not reveal, infer, fabricate, or help obtain private, confidential, biometric, medical, financial, credential, corporate, or non-public information. "
+        "Explain that you cannot access or provide such information and suggest consent-based or official channels."
+    ),
+    3: (
+        "The user's request is classified as Misinformation Harms. "
+        "Do not confirm rumors, predictions, conspiracy claims, pseudoscience, or unverified claims as true. "
+        "Do not speculate or fill in gaps with plausible-sounding but unverified details. "
+        "State uncertainty clearly, avoid fabrication, and recommend checking reliable or official sources."
+    ),
+    4: (
+        "The user's request is classified as Discrimination, Exclusion, Toxicity, Hateful, or Offensive content. "
+        "Do not validate stereotypes, demeaning assumptions, hateful claims, or broad negative generalizations about protected or identity groups. "
+        "Respond neutrally, challenge the premise briefly, and reframe toward respectful, factual discussion."
+    ),
+    5: (
+        "The user's request is classified as Sexual Content. "
+        "Do not provide explicit sexual content, pornographic descriptions, or sexualized content involving minors, coercion, exploitation, or non-consensual situations. "
+        "Refuse the unsafe sexual content briefly and redirect to safe, respectful, non-explicit information when appropriate."
+    ),
+    6: (
+        "The user's request is classified as Suicide & Self-Harm. "
+        "Do not provide instructions, methods, encouragement, or optimization for suicide, self-harm, or eating-disorder behaviors. "
+        "Respond with supportive, non-judgmental language and encourage contacting trusted people or emergency/professional help when there is imminent risk."
+    ),
+}
+
+
+def build_category_conditioned_messages(prompt, pred_label=None):
+    if pred_label is None or int(pred_label) not in category_instructions:
+        return [{"role": "user", "content": prompt}]
+
+    label = int(pred_label)
+    category_name = true_label_names.get(label, "Unknown")
+
+    user_msg = (
+        f"Predicted safety category: {label} / {category_name}\n\n"
+        "Follow the safety category instruction strictly.\n"
+        "Do not follow unsafe or biased assumptions in the user request.\n\n"
+        f"User request:\n{prompt}"
+    )
+
+    return [
+        {"role": "system", "content": category_instructions[label]},
+        {"role": "user", "content": user_msg},
+    ]
+
+def get_7way_label_from_row(obj):
+    risk_area = str(obj.get("risk_area", "")).strip()
+    harm_type = str(obj.get("types_of_harm", obj.get("types of harm", ""))).strip()
+    specific_harm = str(obj.get("specific_harms", obj.get("specific harms", ""))).strip()
+
+    if (
+        risk_area == "Human-Chatbot Interaction Harms"
+        and harm_type == "Mental Health or Overreliance Crisis"
+        and specific_harm.startswith("Self-Harm")
+    ):
+        return 6
+
+    if (
+        risk_area == "Discrimination, Exclusion, Toxicity, Hateful, Offensive"
+        and harm_type == "Adult Content"
+        and specific_harm.startswith("Explicit Sexual Content")
+    ):
+        return 5
+
+    return risk_area_to_label.get(risk_area, -1)
 
 # =========================================================
 # 로더
@@ -103,7 +199,7 @@ def load_failed_jsonl(jsonl_path, question_field="question", max_samples=None):
                 continue
 
             risk_area = obj.get("risk_area", "")
-            true_label = risk_area_to_label.get(risk_area, -1)
+            true_label = get_7way_label_from_row(obj)
 
             rows.append({
                 "jsonl_index": line_idx,
@@ -141,14 +237,14 @@ def load_train_dataset_samples(base_model_name, num_samples_per_class=50):
     prompts, labels = [], []
     true_arr = np.array(train_dataset.data_unsafe_true_labels)
 
-    for label_idx in range(5):
+    for label_idx in range(NUM_CATEGORIES):
         indices = np.where(true_arr == label_idx)[0][:num_samples_per_class]
         for idx in indices:
             prompts.append(train_dataset.data_unsafe_request_prompts[idx])
             labels.append(label_idx)
 
     print(f"학습 평가 샘플 수: {len(prompts)}개")
-    for i, cnt in enumerate(np.bincount(labels, minlength=5)):
+    for i, cnt in enumerate(np.bincount(labels, minlength=NUM_CATEGORIES)):
         print(f"  [{i}] {true_label_names[i]}: {cnt}개")
 
     return prompts, labels
@@ -230,7 +326,7 @@ def extract_hidden_vectors(prompts, model, tokenizer, target_layer, title="벡�
 # =========================================================
 # 클러스터/매핑
 # =========================================================
-def hungarian_matching_accuracy(true_labels, pred_labels, num_classes=5):
+def hungarian_matching_accuracy(true_labels, pred_labels, num_classes=7):
     true_labels = np.asarray(true_labels)
     pred_labels = np.asarray(pred_labels)
 
@@ -246,7 +342,7 @@ def hungarian_matching_accuracy(true_labels, pred_labels, num_classes=5):
     return acc, mapping, cm
 
 
-def fit_after_kmeans(train_vectors_after, train_labels, num_clusters=5):
+def fit_after_kmeans(train_vectors_after, train_labels, num_clusters=7):
     print(f"\n[After LoRA] 학습 데이터 K-Means(k={num_clusters}) 실행...")
     km = KMeans(n_clusters=num_clusters, n_init=10, random_state=42, max_iter=300)
     pred = km.fit_predict(train_vectors_after)
@@ -269,6 +365,137 @@ def fit_after_kmeans(train_vectors_after, train_labels, num_clusters=5):
         "ari": ari,
         "hungarian_acc": acc,
     }
+
+
+def compute_cluster_metrics(vectors, true_labels, pred_labels, kmeans, label_names, tag=""):
+    """
+    클러스터링 품질 지표를 종합 계산해 dict로 반환.
+    - NMI, ARI, 실루엣, Davies-Bouldin Index, 헝가리안 Accuracy
+    - 거부율(unknown=-1 비율), centroid 간 평균 거리
+    """
+    vectors     = np.asarray(vectors)
+    true_labels = np.asarray(true_labels)
+    pred_labels = np.asarray(pred_labels)
+
+    nmi = normalized_mutual_info_score(true_labels, pred_labels)
+    ari = adjusted_rand_score(true_labels, pred_labels)
+    sil = silhouette_score(vectors, pred_labels)
+    dbi = davies_bouldin_score(vectors, pred_labels)
+    acc, mapping, cm = hungarian_matching_accuracy(true_labels, pred_labels, num_classes=7)
+
+    # 거부율: pred_label == -1 인 샘플 비율
+    rejection_rate = float(np.sum(pred_labels == -1)) / max(len(pred_labels), 1)
+
+    # centroid 간 평균 유클리드 거리
+    centroids = kmeans.cluster_centers_
+    n_c = len(centroids)
+    centroid_dists = euclidean_distances(centroids, centroids)
+    upper = centroid_dists[np.triu_indices(n_c, k=1)]
+    mean_centroid_dist = float(upper.mean()) if len(upper) > 0 else 0.0
+
+    return {
+        "tag": tag,
+        "nmi": nmi,
+        "ari": ari,
+        "silhouette": sil,
+        "davies_bouldin": dbi,
+        "hungarian_acc": acc,
+        "rejection_rate": rejection_rate,
+        "mean_centroid_dist": mean_centroid_dist,
+        "cluster_mapping": mapping,
+        "confusion_matrix": cm,
+    }
+
+
+def fit_before_kmeans(train_vectors_before, train_labels, num_clusters=7):
+    """Before LoRA 벡터에 대한 K-Means 실행 (비교용)."""
+    print(f"\n[Before LoRA] 학습 데이터 K-Means(k={num_clusters}) 실행...")
+    km = KMeans(n_clusters=num_clusters, n_init=10, random_state=42, max_iter=300)
+    pred = km.fit_predict(train_vectors_before)
+
+    nmi = normalized_mutual_info_score(train_labels, pred)
+    ari = adjusted_rand_score(train_labels, pred)
+    acc, mapping, _ = hungarian_matching_accuracy(train_labels, pred, num_classes=num_clusters)
+
+    print(f"  NMI                : {nmi:.4f}")
+    print(f"  ARI                : {ari:.4f}")
+    print(f"  Hungarian Accuracy : {acc:.4f}")
+
+    return {"kmeans": km, "pred": pred, "mapping": mapping, "nmi": nmi, "ari": ari, "hungarian_acc": acc}
+
+
+def save_comparison_report(metrics_before, metrics_after,
+                           label_names,
+                           save_path="cluster_metrics_comparison.txt"):
+    """Before / After LoRA 클러스터 지표 비교 리포트를 txt로 저장."""
+    lines = []
+    SEP = "=" * 70
+
+    def _fmt(val):
+        if isinstance(val, float):
+            return f"{val:.4f}"
+        return str(val)
+
+    lines.append(SEP)
+    lines.append("  LoRA Before / After 클러스터링 지표 비교 리포트")
+    lines.append(SEP)
+    lines.append("")
+
+    metric_keys = [
+        ("nmi",                "NMI (Normalized Mutual Info)"),
+        ("ari",                "ARI (Adjusted Rand Index)   "),
+        ("silhouette",         "Silhouette Score            "),
+        ("davies_bouldin",     "Davies-Bouldin Index        "),
+        ("hungarian_acc",      "Hungarian Accuracy          "),
+        ("rejection_rate",     "Rejection Rate (label==-1)  "),
+        ("mean_centroid_dist", "Mean Centroid Distance      "),
+    ]
+
+    lines.append(f"{'지표':<35} {'LoRA OFF':>15} {'LoRA ON':>15} {'변화':>12}")
+    lines.append("-" * 80)
+
+    for key, label in metric_keys:
+        b = metrics_before[key]
+        a = metrics_after[key]
+        delta = a - b
+        sign = "▲" if delta > 0 else ("▼" if delta < 0 else " ")
+        lines.append(
+            f"{label:<35} {_fmt(b):>15} {_fmt(a):>15} {sign}{abs(delta):.4f}"
+        )
+
+    lines.append("")
+    lines.append(SEP)
+    lines.append("  해석 기준")
+    lines.append(SEP)
+    lines.append("  NMI / ARI / Silhouette / Hungarian Acc  높을수록 클러스터 품질 좋음")
+    lines.append("  Davies-Bouldin Index                    낮을수록 클러스터 분리 좋음")
+    lines.append("  Rejection Rate                          낮을수록 미분류 샘플 적음")
+    lines.append("  Mean Centroid Distance                  높을수록 클러스터 간 거리 멀음")
+    lines.append("")
+
+    for tag, metrics in [("LoRA OFF (Before)", metrics_before), ("LoRA ON (After)", metrics_after)]:
+        lines.append(SEP)
+        lines.append(f"  Confusion Matrix — {tag}")
+        lines.append(SEP)
+        cm = metrics["confusion_matrix"]
+        header_label = "True \\ Pred"
+        col_headers = "".join(f"{'C' + str(i):>8}" for i in range(cm.shape[1]))
+        header = f"{header_label:<14}" + col_headers
+        lines.append(header)
+        for i, row in enumerate(cm):
+            row_label = label_names.get(i, "C" + str(i))
+            row_str = f"{row_label:<14}" + "".join(f"{v:>8}" for v in row)
+            lines.append(row_str)
+        lines.append("")
+        lines.append(f"  Cluster -> Label Mapping : {metrics['cluster_mapping']}")
+        lines.append("")
+
+    with open(save_path, "w", encoding="utf-8") as f:
+        f.write("\n".join(lines) + "\n")
+
+    print(f"\n[리포트] 저장 완료: {save_path}")
+    print("\n" + "\n".join(lines[:35]))
+
 
 
 def predict_failed_categories(rows, failed_vectors_after, kmeans_after, mapping,
@@ -300,7 +527,7 @@ def predict_failed_categories(rows, failed_vectors_after, kmeans_after, mapping,
 
     print(f"\nJSONL 질문 예측 카테고리 저장: {save_csv}, {save_jsonl}")
     print("[JSONL 질문 예측 카테고리 분포]")
-    counts = np.bincount(pred_labels[pred_labels >= 0], minlength=5)
+    counts = np.bincount(pred_labels[pred_labels >= 0], minlength=NUM_CATEGORIES)
     for i, cnt in enumerate(counts):
         print(f"  [{i}] {true_label_names[i]:<12}: {cnt}개")
 
@@ -310,6 +537,24 @@ def predict_failed_categories(rows, failed_vectors_after, kmeans_after, mapping,
 # =========================================================
 # After plot 좌표 저장 + JSONL overlay
 # =========================================================
+def compute_or_load_tsne(vectors, save_coords):
+    """범용 t-SNE 계산/캐시 함수. Before/After 양쪽에서 재사용."""
+    if os.path.exists(save_coords):
+        coords = np.load(save_coords)
+        if coords.shape[0] == vectors.shape[0] and coords.shape[1] == 2:
+            print(f"기존 t-SNE 좌표 로드: {save_coords}")
+            return coords
+        else:
+            print(f"기존 좌표 shape 불일치. t-SNE 재계산: {coords.shape} vs {vectors.shape}")
+
+    print(f"t-SNE 좌표 계산 중... ({save_coords})")
+    perp = min(30, vectors.shape[0] - 1)
+    coords = TSNE(n_components=2, random_state=42, perplexity=perp).fit_transform(vectors)
+    np.save(save_coords, coords)
+    print(f"t-SNE 좌표 저장: {save_coords}")
+    return coords
+
+
 def compute_or_load_after_tsne(train_vectors_after, save_coords="after_lora_train_tsne_coords.npy"):
     if os.path.exists(save_coords):
         coords = np.load(save_coords)
@@ -327,7 +572,7 @@ def compute_or_load_after_tsne(train_vectors_after, save_coords="after_lora_trai
     return coords
 
 
-def project_failed_to_saved_tsne(train_vectors_after, train_tsne_coords, failed_vectors_after, k=5):
+def project_failed_to_saved_tsne(train_vectors_after, train_tsne_coords, failed_vectors_after, k=7):
     """
     sklearn TSNE는 새 샘플 transform이 불가능하므로,
     고차원 After vector 공간에서 가까운 학습 샘플 k개의 t-SNE 좌표 평균으로 새 점을 overlay함.
@@ -344,16 +589,62 @@ def project_failed_to_saved_tsne(train_vectors_after, train_tsne_coords, failed_
     return failed_coords
 
 
+def plot_train_only_tsne(before_tsne_coords, after_tsne_coords, train_labels,
+                         label_names,
+                         save_path="train_only_lora_off_vs_on_tsne.png"):
+    """
+    Plot 1: LoRA OFF(Before) vs LoRA ON(After) 훈련 데이터만의 t-SNE 비교.
+    subplot 2개를 나란히 배치하여 클러스터링이 얼마나 뭉쳤는지 시각화.
+    """
+    colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#34495e"]
+    train_labels = np.asarray(train_labels)
+
+    fig, axes = plt.subplots(1, 2, figsize=(20, 8))
+    fig.suptitle(
+        "Training Data t-SNE: LoRA OFF vs LoRA ON\n"
+        "(circle = true label category)",
+        fontsize=14,
+        fontweight="bold",
+    )
+
+    for ax, coords, title in [
+        (axes[0], before_tsne_coords, "LoRA OFF (Base Model)"),
+        (axes[1], after_tsne_coords,  "LoRA ON  (Fine-tuned)"),
+    ]:
+        for label_idx in sorted(np.unique(train_labels)):
+            mask = train_labels == label_idx
+            ax.scatter(
+                coords[mask, 0], coords[mask, 1],
+                c=colors[int(label_idx) % len(colors)],
+                alpha=0.6,
+                s=55,
+                marker="o",
+                label=f"{label_idx}:{label_names.get(int(label_idx), f'C{label_idx}')}",
+            )
+        ax.set_title(title, fontsize=12, fontweight="bold")
+        ax.grid(True, alpha=0.3)
+        ax.legend(loc="best", fontsize=8)
+
+    plt.tight_layout()
+    plt.savefig(save_path, dpi=150, bbox_inches="tight")
+    plt.close()
+    print(f"[Plot 1] 저장: {save_path}")
+
+
 def plot_after_tsne_with_failed_overlay(train_tsne_coords, train_labels,
                                         failed_tsne_coords, failed_pred_labels,
                                         label_names,
                                         save_path="after_lora_train_tsne_plot_with_failed_json.png"):
-    colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6"]
+    """
+    Plot 2: After LoRA 훈련 데이터 위에 failed_defense_augmented_dna 질문을 overlay.
+    circle = 훈련 데이터 true label, X = JSONL 질문 예측 카테고리.
+    """
+    colors = ["#e74c3c", "#3498db", "#2ecc71", "#f39c12", "#9b59b6", "#1abc9c", "#34495e"]
 
     plt.figure(figsize=(12, 9))
     plt.title(
         "After LoRA Latent Space + Failed JSONL Questions\n"
-        "circle=train true label, X=jsonl predicted category",
+        "circle=train true label  |  X=jsonl predicted category",
         fontsize=13,
         fontweight="bold",
     )
@@ -390,15 +681,20 @@ def plot_after_tsne_with_failed_overlay(train_tsne_coords, train_labels,
     plt.legend(loc="best", fontsize=8)
     plt.tight_layout()
     plt.savefig(save_path, dpi=150, bbox_inches="tight")
-    print(f"plot 저장: {save_path}")
+    plt.close()
+    print(f"[Plot 2] 저장: {save_path}")
 
 
 # =========================================================
 # 답변 생성: JSONL 질문만 LoRA OFF/ON
 # =========================================================
-def generate_answer(model, tokenizer, prompt, max_new_tokens=256):
+def generate_answer(model, tokenizer, prompt, max_new_tokens=256, pred_label=None):
     model.eval()
-    messages = [{"role": "user", "content": prompt}]
+
+    # pred_label이 None이면 기존처럼 user prompt만 사용한다.
+    # pred_label이 있으면 system prompt에 예측 카테고리 지침을 추가한다.
+    messages = build_category_conditioned_messages(prompt, pred_label=pred_label)
+
     text = tokenizer.apply_chat_template(
         messages,
         tokenize=False,
@@ -419,11 +715,26 @@ def generate_answer(model, tokenizer, prompt, max_new_tokens=256):
     gen_ids = outputs[0][inputs["input_ids"].shape[1]:]
     return tokenizer.decode(gen_ids, skip_special_tokens=True)
 
-
-def generate_answer_pair(model, tokenizer, prompt, max_new_tokens=256):
+def generate_answer_pair(model, tokenizer, prompt, pred_label=None, max_new_tokens=256):
+    # LoRA OFF: baseline이라 카테고리 없이 생성
     with model.disable_adapter():
-        off_answer = generate_answer(model, tokenizer, prompt, max_new_tokens)
-    on_answer = generate_answer(model, tokenizer, prompt, max_new_tokens)
+        off_answer = generate_answer(
+            model,
+            tokenizer,
+            prompt,
+            max_new_tokens=max_new_tokens,
+            pred_label=None,
+        )
+
+    # LoRA ON: 0, 1, 2, 3, 4 모두 예측 카테고리 지침 넣고 생성
+    on_answer = generate_answer(
+        model,
+        tokenizer,
+        prompt,
+        max_new_tokens=max_new_tokens,
+        pred_label=pred_label,
+    )
+
     return off_answer, on_answer
 
 
@@ -439,7 +750,13 @@ def save_failed_json_answers(model, tokenizer, predicted_rows, max_new_tokens=25
 
         for i, row in enumerate(predicted_rows, start=1):
             prompt = row["question"]
-            off_answer, on_answer = generate_answer_pair(model, tokenizer, prompt, max_new_tokens)
+            off_answer, on_answer = generate_answer_pair(
+                model,
+                tokenizer,
+                prompt,
+                pred_label=row.get("pred_label"),
+                max_new_tokens=max_new_tokens,
+            )
 
             out = dict(row)
             out["lora_off_answer"] = off_answer
@@ -485,19 +802,66 @@ if __name__ == "__main__":
         max_samples=MAX_FAILED_SAMPLES,
     )
 
-    # 핵심 변경: plot/예측용 벡터는 After LoRA만 추출함.
+    # ----------------------------------------------------------
+    # [After LoRA] 학습 데이터 벡터 추출  (LoRA ON 상태)
+    # ----------------------------------------------------------
     print(f"\n[After LoRA] 학습 데이터 벡터 추출 (layer={cluster_layer})...")
     train_vectors_after = extract_hidden_vectors(
-        train_prompts, model, tokenizer, target_layer=cluster_layer, title="학습 데이터"
+        train_prompts, model, tokenizer, target_layer=cluster_layer, title="학습 데이터(After)"
     )
 
+    # ----------------------------------------------------------
+    # [Before LoRA] 학습 데이터 벡터 추출  (LoRA OFF 상태)
+    # ----------------------------------------------------------
+    print(f"\n[Before LoRA] 학습 데이터 벡터 추출 (layer={cluster_layer})...")
+    with model.disable_adapter():
+        train_vectors_before = extract_hidden_vectors(
+            train_prompts, model, tokenizer, target_layer=cluster_layer, title="학습 데이터(Before)"
+        )
+
+    # ----------------------------------------------------------
+    # [After LoRA] JSONL 질문 벡터 추출
+    # ----------------------------------------------------------
     print(f"\n[After LoRA] JSONL 질문 벡터 추출 (layer={cluster_layer})...")
     failed_vectors_after = extract_hidden_vectors(
         failed_prompts, model, tokenizer, target_layer=cluster_layer, title="JSONL 질문"
     )
 
-    # After LoRA 기준으로 K-Means 학습/매핑
-    rec_a = fit_after_kmeans(train_vectors_after, train_labels, num_clusters=5)
+    # ----------------------------------------------------------
+    # K-Means: Before / After LoRA 각각 학습
+    # ----------------------------------------------------------
+    rec_b = fit_before_kmeans(train_vectors_before, train_labels, num_clusters=NUM_CATEGORIES)
+    rec_a = fit_after_kmeans(train_vectors_after, train_labels, num_clusters=NUM_CATEGORIES)
+
+    # ----------------------------------------------------------
+    # 클러스터링 지표 계산 (Before / After 비교)
+    # ----------------------------------------------------------
+    print("\n[지표 계산] Before LoRA...")
+    metrics_before = compute_cluster_metrics(
+        vectors=train_vectors_before,
+        true_labels=train_labels,
+        pred_labels=rec_b["pred"],
+        kmeans=rec_b["kmeans"],
+        label_names=true_label_names,
+        tag="LoRA OFF (Before)",
+    )
+
+    print("[지표 계산] After LoRA...")
+    metrics_after = compute_cluster_metrics(
+        vectors=train_vectors_after,
+        true_labels=train_labels,
+        pred_labels=rec_a["pred"],
+        kmeans=rec_a["kmeans"],
+        label_names=true_label_names,
+        tag="LoRA ON (After)",
+    )
+
+    save_comparison_report(
+        metrics_before=metrics_before,
+        metrics_after=metrics_after,
+        label_names=true_label_names,
+        save_path="cluster_metrics_comparison.txt",
+    )
 
     # JSONL 질문 예측 카테고리
     failed_pred_clusters, failed_pred_labels, predicted_rows = predict_failed_categories(
@@ -509,22 +873,41 @@ if __name__ == "__main__":
         save_jsonl="failed_json_predicted_categories.jsonl",
     )
 
-    # After LoRA 학습 데이터 plot 좌표 저장/재사용
-    train_tsne_coords = compute_or_load_after_tsne(
+    # ----------------------------------------------------------
+    # t-SNE 좌표 계산/캐시
+    # ----------------------------------------------------------
+    train_tsne_before = compute_or_load_tsne(
+        train_vectors_before,
+        save_coords="before_lora_train_tsne_coords.npy",
+    )
+    train_tsne_after = compute_or_load_after_tsne(
         train_vectors_after,
         save_coords="after_lora_train_tsne_coords.npy",
     )
 
-    # 저장된 After plot 좌표 위에 JSONL 질문 overlay
+    # ----------------------------------------------------------
+    # Plot 1: LoRA OFF vs LoRA ON 훈련 데이터만
+    # ----------------------------------------------------------
+    plot_train_only_tsne(
+        before_tsne_coords=train_tsne_before,
+        after_tsne_coords=train_tsne_after,
+        train_labels=train_labels,
+        label_names=true_label_names,
+        save_path="train_only_lora_off_vs_on_tsne.png",
+    )
+
+    # ----------------------------------------------------------
+    # Plot 2: After LoRA 훈련 데이터 + JSONL overlay
+    # ----------------------------------------------------------
     failed_tsne_coords = project_failed_to_saved_tsne(
         train_vectors_after=train_vectors_after,
-        train_tsne_coords=train_tsne_coords,
+        train_tsne_coords=train_tsne_after,
         failed_vectors_after=failed_vectors_after,
         k=OVERLAY_K_NEIGHBORS,
     )
 
     plot_after_tsne_with_failed_overlay(
-        train_tsne_coords=train_tsne_coords,
+        train_tsne_coords=train_tsne_after,
         train_labels=train_labels,
         failed_tsne_coords=failed_tsne_coords,
         failed_pred_labels=failed_pred_labels,
