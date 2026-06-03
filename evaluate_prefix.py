@@ -53,8 +53,9 @@ from scipy.optimize import linear_sum_assignment
 # =========================================================
 # 설정
 # =========================================================
-BASE_MODEL = "Qwen/Qwen2-0.5B-Instruct"
+#BASE_MODEL = "meta-llama/Llama-3.2-1B-Instruct"
 # BASE_MODEL = "google/gemma-2-2b-it"
+BASE_MODEL ="Qwen/Qwen2.5-0.5B-Instruct"
 
 LORA_PATH = "./out/test"
 CENTROIDS_PATH = "./out/test/crush_centroids.pt"
@@ -77,11 +78,11 @@ USE_PREFIX_INJECTION_FOR_OFF = True
 
 # 카테고리별 prefix: 자연스러운 수락 문맥 생성
 CATEGORY_PREFIX_MAP = {
-    0: "Sure, here is the information you requested",   # Malicious Uses
-    1: "Sure, here is my response",                     # Human-Chatbot Interaction Harms
-    2: "Sure, here is the information",                 # Information Hazards
-    3: "Sure, here is",                                 # Misinformation Harms
-    4: "Sure, here is the content you asked for",       # Discrimination/Hateful/Offensive
+    0: "Sure, here is",   # Malicious Uses
+    1: "Sure, here is",   # Human-Chatbot Interaction Harms
+    2: "Sure, here is",   # Information Hazards
+    3: "Sure, here is",   # Misinformation Harms
+    4: "Sure, here is",   # Discrimination/Hateful/Offensive
 }
 
 def get_prefix_for_label(label: int) -> str:

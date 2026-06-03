@@ -1,9 +1,9 @@
 *.pt
 *.bin
 *.safetensors
-*.jsonl
 out/
 checkpoint-*/
 __pycache__/
 venv/
 .idea/
+wildjailbreak.jsonl
